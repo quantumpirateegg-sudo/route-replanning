@@ -1,0 +1,761 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Route Replanning Simulator - Stable R3F v9</title>
+  <style>
+    html, body, #root {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #0f172a;
+    }
+
+    .app-shell {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+      background: #0f172a;
+    }
+
+    .hud {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      z-index: 10;
+      padding: 10px 14px;
+      border-radius: 10px;
+      background: rgba(15, 23, 42, 0.72);
+      color: #e2e8f0;
+      font-size: 14px;
+      line-height: 1.5;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      backdrop-filter: blur(8px);
+      pointer-events: none;
+      user-select: none;
+    }
+  </style>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "react": "https://esm.sh/react@19",
+        "react-dom/client": "https://esm.sh/react-dom@19/client",
+        "three": "https://esm.sh/three@0.170.0",
+        "@react-three/fiber": "https://esm.sh/@react-three/fiber@9",
+        "@react-three/rapier": "https://esm.sh/@react-three/rapier@2"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="module">
+    import React, { useEffect, useMemo, useRef, useState } from 'react';
+    import { createRoot } from 'react-dom/client';
+    import * as THREE from 'three';
+    import { Canvas, useFrame, useThree } from '@react-three/fiber';
+    import { Physics, RigidBody, CuboidCollider, CapsuleCollider } from '@react-three/rapier';
+
+    const GRID_CONFIG = {
+      WIDTH: 20,
+      HEIGHT: 20,
+      CELL_SIZE: 5,
+      HALF_RANGE: 8
+    };
+
+    const CAMERA_CONFIG = {
+      POSITION: [40, 45, 40],
+      FOV: 60,
+      NEAR: 0.1,
+      FAR: 1000
+    };
+
+    const GROUND_CONFIG = {
+      SIZE: 100,
+      COLOR: '#475569',
+      THICKNESS: 1
+    };
+
+    const AGENT_CONFIG = {
+      SPEED: 6,
+      SLOPE_SPEED_RATIO: 0.35, // 경사로를 오를 때 속도 배율 (천천히 이동)
+      ARRIVAL_DISTANCE: 0.45,
+      INITIAL_POS: [-40, 1.2, -40]
+    };
+
+    const OBSTACLE_CONFIG = {
+      SIZE: 5,
+      HEIGHT: 2
+    };
+
+    // 장애물 생성 강도: 기존 10초당 1개 -> 3초당 여러 개로 상승
+    const OBSTACLE_SPAWN_CONFIG = {
+      INTERVAL_MS: 3000,
+      SPAWN_COUNT: 3,
+      SLOPE_RATIO: 0.4 // 새로 막히는 칸 중 "경사가 높은 구간"으로 생성될 확률
+    };
+
+    // 이동하는 차량 (교통 약자 이동 시 어려움을 겪는 장애물 종류)
+    const VEHICLE_CONFIG = {
+      LANES: [
+        { laneZ: -4, count: 2, speed: 3.2 },
+        { laneZ: 4, count: 2, speed: 2.6 }
+      ],
+      BODY_SIZE: [1.6, 0.9, 3.2]
+    };
+
+    // 횡단보도 (신호에 따라 통행 가능 여부가 바뀌는 장애물 종류)
+    const CROSSWALK_CONFIG = {
+      CYCLE_MS: 6000,
+      RED_RATIO: 0.5,
+      COLUMNS: [-6, 0, 6]
+    };
+
+    const DYNAMIC_TICK_MS = 400;
+
+    const START_NODE = { x: -8, z: -8 };
+    const GOAL_NODE = { x: 8, z: 8 };
+
+    const toNodeKey = (x, z) => `${x},${z}`;
+
+    const CROSSWALK_KEYS = VEHICLE_CONFIG.LANES.flatMap((lane) =>
+      CROSSWALK_CONFIG.COLUMNS.map((x) => toNodeKey(x, lane.laneZ))
+    );
+
+    const isCrosswalkRed = (elapsedMs) => {
+      const phase = elapsedMs % CROSSWALK_CONFIG.CYCLE_MS;
+      return phase < CROSSWALK_CONFIG.CYCLE_MS * CROSSWALK_CONFIG.RED_RATIO;
+    };
+
+    const createInitialVehicles = () => {
+      const vehicles = [];
+      let id = 0;
+      const laneWidth = GRID_CONFIG.HALF_RANGE * GRID_CONFIG.CELL_SIZE * 2;
+      for (const lane of VEHICLE_CONFIG.LANES) {
+        for (let i = 0; i < lane.count; i++) {
+          vehicles.push({
+            id: id++,
+            laneZ: lane.laneZ,
+            x: -GRID_CONFIG.HALF_RANGE * GRID_CONFIG.CELL_SIZE + i * (laneWidth / lane.count),
+            dir: i % 2 === 0 ? 1 : -1,
+            speed: lane.speed
+          });
+        }
+      }
+      return vehicles;
+    };
+
+    // 경사로(slope)는 통행 가능(대신 느려짐) - 실제로 길을 막는 종류만 차단 처리
+    const BLOCKING_TYPES = new Set(['barrier', 'crosswalk', 'vehicle']);
+
+    const isBlockedCell = (x, z, obstacles) => BLOCKING_TYPES.has(obstacles.get(toNodeKey(x, z)));
+
+    const isWalkable = (x, z, obstacles) => {
+      return Math.abs(x) <= GRID_CONFIG.HALF_RANGE && Math.abs(z) <= GRID_CONFIG.HALF_RANGE && !isBlockedCell(x, z, obstacles);
+    };
+
+    const heuristic = (a, b) => Math.abs(a.x - b.x) + Math.abs(a.z - b.z);
+
+    const getNeighbors = (node) => ([
+      { x: node.x + 1, z: node.z },
+      { x: node.x - 1, z: node.z },
+      { x: node.x, z: node.z + 1 },
+      { x: node.x, z: node.z - 1 }
+    ]);
+
+    const reconstructPath = (cameFrom, currentKey) => {
+      const path = [];
+      let key = currentKey;
+      while (key) {
+        const [x, z] = key.split(',').map(Number);
+        path.push({ x, z });
+        key = cameFrom.get(key) ?? null;
+      }
+      return path.reverse();
+    };
+
+    const findPathAStar = (start, goal, obstacles) => {
+      const openSet = [start];
+      const openSetKeys = new Set([toNodeKey(start.x, start.z)]);
+      const cameFrom = new Map();
+      const gScore = new Map([[toNodeKey(start.x, start.z), 0]]);
+      const fScore = new Map([[toNodeKey(start.x, start.z), heuristic(start, goal)]]);
+
+      while (openSet.length > 0) {
+        let currentIndex = 0;
+        let current = openSet[0];
+        let currentKey = toNodeKey(current.x, current.z);
+        let lowestF = fScore.get(currentKey) ?? Infinity;
+
+        for (let i = 1; i < openSet.length; i++) {
+          const node = openSet[i];
+          const key = toNodeKey(node.x, node.z);
+          const score = fScore.get(key) ?? Infinity;
+          if (score < lowestF) {
+            lowestF = score;
+            current = node;
+            currentKey = key;
+            currentIndex = i;
+          }
+        }
+
+        if (current.x === goal.x && current.z === goal.z) {
+          return reconstructPath(cameFrom, currentKey);
+        }
+
+        openSet.splice(currentIndex, 1);
+        openSetKeys.delete(currentKey);
+
+        for (const neighbor of getNeighbors(current)) {
+          if (!isWalkable(neighbor.x, neighbor.z, obstacles)) continue;
+
+          const neighborKey = toNodeKey(neighbor.x, neighbor.z);
+          const tentativeG = (gScore.get(currentKey) ?? Infinity) + 1;
+
+          if (tentativeG < (gScore.get(neighborKey) ?? Infinity)) {
+            cameFrom.set(neighborKey, currentKey);
+            gScore.set(neighborKey, tentativeG);
+            fScore.set(neighborKey, tentativeG + heuristic(neighbor, goal));
+
+            if (!openSetKeys.has(neighborKey)) {
+              openSet.push(neighbor);
+              openSetKeys.add(neighborKey);
+            }
+          }
+        }
+      }
+
+      return [];
+    };
+
+    const getNearestGridNode = (position) => ({
+      x: Math.max(-GRID_CONFIG.HALF_RANGE, Math.min(GRID_CONFIG.HALF_RANGE, Math.round(position.x / GRID_CONFIG.CELL_SIZE))),
+      z: Math.max(-GRID_CONFIG.HALF_RANGE, Math.min(GRID_CONFIG.HALF_RANGE, Math.round(position.z / GRID_CONFIG.CELL_SIZE)))
+    });
+
+    const spawnObstacles = (currentObstacles, count, slopeRatio, excludeNodes) => {
+      const excludeKeys = new Set(excludeNodes.map((n) => toNodeKey(n.x, n.z)));
+      const next = new Map(currentObstacles);
+
+      for (let i = 0; i < count; i++) {
+        const candidates = [];
+        for (let x = -GRID_CONFIG.HALF_RANGE; x <= GRID_CONFIG.HALF_RANGE; x++) {
+          for (let z = -GRID_CONFIG.HALF_RANGE; z <= GRID_CONFIG.HALF_RANGE; z++) {
+            const key = toNodeKey(x, z);
+            if (!next.has(key) && !excludeKeys.has(key)) {
+              candidates.push(key);
+            }
+          }
+        }
+
+        if (candidates.length === 0) break;
+        const chosenKey = candidates[Math.floor(Math.random() * candidates.length)];
+        const type = Math.random() < slopeRatio ? 'slope' : 'barrier';
+        next.set(chosenKey, type);
+      }
+
+      return next;
+    };
+
+    const OrbitCameraController = () => {
+      const { camera, gl } = useThree();
+      const stateRef = useRef({
+        dragging: false,
+        lastX: 0,
+        lastY: 0,
+        theta: 0.9,
+        phi: 0.85,
+        radius: 70
+      });
+
+      const updateCamera = () => {
+        const { theta, phi, radius } = stateRef.current;
+        camera.position.set(
+          radius * Math.sin(phi) * Math.sin(theta),
+          radius * Math.cos(phi),
+          radius * Math.sin(phi) * Math.cos(theta)
+        );
+        camera.lookAt(0, 0, 0);
+      };
+
+      useEffect(() => {
+        updateCamera();
+      }, [camera]);
+
+      useEffect(() => {
+        const canvas = gl.domElement;
+
+        const onMouseDown = (e) => {
+          stateRef.current.dragging = true;
+          stateRef.current.lastX = e.clientX;
+          stateRef.current.lastY = e.clientY;
+        };
+
+        const onMouseMove = (e) => {
+          if (!stateRef.current.dragging) return;
+          const dx = e.clientX - stateRef.current.lastX;
+          const dy = e.clientY - stateRef.current.lastY;
+          stateRef.current.lastX = e.clientX;
+          stateRef.current.lastY = e.clientY;
+          stateRef.current.theta -= dx * 0.005;
+          stateRef.current.phi = THREE.MathUtils.clamp(stateRef.current.phi - dy * 0.005, 0.1, Math.PI - 0.1);
+          updateCamera();
+        };
+
+        const onMouseUp = () => {
+          stateRef.current.dragging = false;
+        };
+
+        const onWheel = (e) => {
+          stateRef.current.radius = THREE.MathUtils.clamp(stateRef.current.radius + e.deltaY * 0.02, 20, 120);
+          updateCamera();
+        };
+
+        canvas.addEventListener('mousedown', onMouseDown);
+        window.addEventListener('mousemove', onMouseMove);
+        window.addEventListener('mouseup', onMouseUp);
+        canvas.addEventListener('wheel', onWheel, { passive: true });
+
+        return () => {
+          canvas.removeEventListener('mousedown', onMouseDown);
+          window.removeEventListener('mousemove', onMouseMove);
+          window.removeEventListener('mouseup', onMouseUp);
+          canvas.removeEventListener('wheel', onWheel);
+        };
+      }, [camera, gl]);
+
+      return null;
+    };
+
+    const GridTiles = ({ obstacles }) => {
+      const meshes = [];
+      for (let x = -GRID_CONFIG.WIDTH / 2; x < GRID_CONFIG.WIDTH / 2; x++) {
+        for (let z = -GRID_CONFIG.HEIGHT / 2; z < GRID_CONFIG.HEIGHT / 2; z++) {
+          const key = `${x},${z}`;
+          const type = obstacles.get(key);
+          let tileColor = isWalkable(x, z, obstacles) ? '#334155' : '#1e293b';
+          if (type === 'barrier') tileColor = '#ef4444';
+          else if (type === 'slope') tileColor = '#fb923c';
+          meshes.push(
+            React.createElement(
+              'mesh',
+              {
+                key: `${x}-${z}`,
+                position: [x * GRID_CONFIG.CELL_SIZE, 0.02, z * GRID_CONFIG.CELL_SIZE]
+              },
+              React.createElement('boxGeometry', { args: [GRID_CONFIG.CELL_SIZE, 0.04, GRID_CONFIG.CELL_SIZE] }),
+              React.createElement('meshStandardMaterial', {
+                color: tileColor,
+                roughness: 1
+              })
+            )
+          );
+        }
+      }
+      return React.createElement(React.Fragment, null, ...meshes);
+    };
+
+    const ObstacleBlocks = ({ obstacles }) =>
+      React.createElement(
+        React.Fragment,
+        null,
+        ...Array.from(obstacles.entries())
+          .filter(([, type]) => type === 'barrier' || type === 'slope')
+          .map(([key, type]) => {
+            const [x, z] = key.split(',').map(Number);
+            if (type === 'slope') {
+              return React.createElement(
+                'mesh',
+                {
+                  key,
+                  position: [x * GRID_CONFIG.CELL_SIZE, 0.75, z * GRID_CONFIG.CELL_SIZE],
+                  rotation: [0.35, 0, 0]
+                },
+                React.createElement('boxGeometry', { args: [OBSTACLE_CONFIG.SIZE * 0.9, 0.3, OBSTACLE_CONFIG.SIZE * 1.4] }),
+                React.createElement('meshStandardMaterial', { color: '#fb923c', roughness: 0.8 })
+              );
+            }
+            return React.createElement(
+              'mesh',
+              {
+                key,
+                position: [x * GRID_CONFIG.CELL_SIZE, OBSTACLE_CONFIG.HEIGHT / 2, z * GRID_CONFIG.CELL_SIZE]
+              },
+              React.createElement('boxGeometry', { args: [OBSTACLE_CONFIG.SIZE, OBSTACLE_CONFIG.HEIGHT, OBSTACLE_CONFIG.SIZE] }),
+              React.createElement('meshStandardMaterial', { color: '#ef4444', roughness: 0.7 })
+            );
+          })
+      );
+
+    const CrosswalkMarkers = ({ crosswalkRed }) =>
+      React.createElement(
+        React.Fragment,
+        null,
+        ...CROSSWALK_KEYS.map((key) => {
+          const [x, z] = key.split(',').map(Number);
+          return React.createElement(
+            'mesh',
+            {
+              key,
+              position: [x * GRID_CONFIG.CELL_SIZE, 0.05, z * GRID_CONFIG.CELL_SIZE],
+              rotation: [-Math.PI / 2, 0, 0]
+            },
+            React.createElement('planeGeometry', { args: [GRID_CONFIG.CELL_SIZE * 0.9, GRID_CONFIG.CELL_SIZE * 0.9] }),
+            React.createElement('meshStandardMaterial', { color: crosswalkRed ? '#f87171' : '#86efac', roughness: 1 })
+          );
+        })
+      );
+
+    const VehicleAgent = ({ vehicle, onPositionUpdate }) => {
+      const meshRef = useRef(null);
+      const stateRef = useRef({ x: vehicle.x, dir: vehicle.dir });
+
+      useFrame((_, delta) => {
+        const s = stateRef.current;
+        const limit = GRID_CONFIG.HALF_RANGE * GRID_CONFIG.CELL_SIZE;
+        s.x += s.dir * vehicle.speed * delta;
+        if (s.x > limit) { s.x = limit; s.dir = -1; }
+        if (s.x < -limit) { s.x = -limit; s.dir = 1; }
+        if (meshRef.current) {
+          meshRef.current.position.x = s.x;
+        }
+        onPositionUpdate(vehicle.id, s.x, vehicle.laneZ);
+      });
+
+      return React.createElement(
+        'mesh',
+        {
+          ref: meshRef,
+          position: [vehicle.x, 0.6, vehicle.laneZ * GRID_CONFIG.CELL_SIZE],
+          castShadow: true
+        },
+        React.createElement('boxGeometry', { args: VEHICLE_CONFIG.BODY_SIZE }),
+        React.createElement('meshStandardMaterial', { color: '#facc15', roughness: 0.4, metalness: 0.3 })
+      );
+    };
+
+    const GoalMarker = ({ goal }) =>
+      React.createElement(
+        'mesh',
+        { position: [goal.x * GRID_CONFIG.CELL_SIZE, 0.6, goal.z * GRID_CONFIG.CELL_SIZE] },
+        React.createElement('coneGeometry', { args: [0.6, 1.2, 4] }),
+        React.createElement('meshStandardMaterial', { color: '#ec4899' })
+      );
+    const Ground = ({ onGroundClick }) => {
+      const dragStartRef = useRef(null);
+
+      return React.createElement(
+        RigidBody,
+        { type: 'fixed', colliders: false },
+        React.createElement('mesh', {
+          rotation: [-Math.PI / 2, 0, 0],
+          receiveShadow: true,
+          onPointerDown: (e) => {
+            dragStartRef.current = { x: e.clientX, y: e.clientY };
+          },
+          onPointerUp: (e) => {
+            const start = dragStartRef.current;
+            dragStartRef.current = null;
+            if (!start) return;
+            const dx = e.clientX - start.x;
+            const dy = e.clientY - start.y;
+            if (Math.sqrt(dx * dx + dy * dy) < 6) {
+              onGroundClick(getNearestGridNode(e.point));
+            }
+          }
+        },
+          React.createElement('planeGeometry', { args: [GROUND_CONFIG.SIZE, GROUND_CONFIG.SIZE] }),
+          React.createElement('meshStandardMaterial', { color: GROUND_CONFIG.COLOR, roughness: 0.8 })
+        ),
+        React.createElement(CuboidCollider, {
+          args: [GROUND_CONFIG.SIZE / 2, GROUND_CONFIG.THICKNESS / 2, GROUND_CONFIG.SIZE / 2],
+          position: [0, -GROUND_CONFIG.THICKNESS / 2, 0]
+        })
+      );
+    };
+
+    const SimulationLights = () =>
+      React.createElement(
+        React.Fragment,
+        null,
+        React.createElement('ambientLight', { intensity: 0.55 }),
+        React.createElement('directionalLight', { position: [20, 20, 10], intensity: 1, castShadow: true })
+      );
+
+    const PathLine = ({ path }) => {
+      if (path.length < 2) return null;
+
+      const points = path.map((node) => new THREE.Vector3(
+        node.x * GRID_CONFIG.CELL_SIZE,
+        0.18,
+        node.z * GRID_CONFIG.CELL_SIZE
+      ));
+
+      const positions = useMemo(() => {
+        const arr = [];
+        for (const p of points) arr.push(p.x, p.y, p.z);
+        return new Float32Array(arr);
+      }, [path]);
+
+      return React.createElement(
+        'line',
+        null,
+        React.createElement('bufferGeometry', {
+          attach: 'geometry',
+          attributes: {
+            position: new THREE.BufferAttribute(positions, 3)
+          }
+        }),
+        React.createElement('lineBasicMaterial', { color: '#fbbf24' })
+      );
+    };
+
+    const PathWaypointMarkers = ({ path, currentIndex }) =>
+      React.createElement(
+        React.Fragment,
+        null,
+        ...path.map((node, index) =>
+          React.createElement(
+            'mesh',
+            {
+              key: `${node.x}-${node.z}-${index}`,
+              position: [node.x * GRID_CONFIG.CELL_SIZE, 0.3, node.z * GRID_CONFIG.CELL_SIZE]
+            },
+            React.createElement('sphereGeometry', { args: [0.25, 16, 16] }),
+            React.createElement('meshStandardMaterial', {
+              color: index < currentIndex ? '#22c55e' : index === currentIndex ? '#f97316' : '#eab308'
+            })
+          )
+        )
+      );
+
+    const PlayerAgent = ({ path, obstacles, goal, onRepathRequest, onProgress, onGridChange }) => {
+      const rbRef = useRef(null);
+      const waypointIndexRef = useRef(0);
+
+      useEffect(() => {
+        waypointIndexRef.current = 0;
+      }, [path]);
+
+      useFrame(() => {
+        if (!rbRef.current) return;
+
+        const translation = rbRef.current.translation();
+        const currentPos = new THREE.Vector3(translation.x, translation.y, translation.z);
+        const currentGrid = getNearestGridNode(currentPos);
+        onGridChange?.(currentGrid);
+
+        if (path.length === 0) return;
+
+        const currentIndex = waypointIndexRef.current;
+        const nextNode = path[currentIndex + 1];
+
+        if (nextNode && isBlockedCell(nextNode.x, nextNode.z, obstacles)) {
+          const newPath = findPathAStar(currentGrid, goal, obstacles);
+          if (newPath.length > 0) {
+            waypointIndexRef.current = 0;
+            onRepathRequest(newPath);
+          } else {
+            rbRef.current.setLinvel({ x: 0, y: 0, z: 0 }, true);
+          }
+          return;
+        }
+
+        const targetNode = path[Math.min(currentIndex, path.length - 1)];
+        const targetPos = new THREE.Vector3(
+          targetNode.x * GRID_CONFIG.CELL_SIZE,
+          1.2,
+          targetNode.z * GRID_CONFIG.CELL_SIZE
+        );
+
+        const direction = targetPos.clone().sub(currentPos);
+        const distance = direction.length();
+
+        if (distance < AGENT_CONFIG.ARRIVAL_DISTANCE) {
+          if (currentIndex < path.length - 1) {
+            waypointIndexRef.current = currentIndex + 1;
+            onProgress?.(currentIndex + 1);
+          } else {
+            rbRef.current.setLinvel({ x: 0, y: 0, z: 0 }, true);
+          }
+          return;
+        }
+
+        const targetType = obstacles.get(toNodeKey(targetNode.x, targetNode.z));
+        const speed = targetType === 'slope' ? AGENT_CONFIG.SPEED * AGENT_CONFIG.SLOPE_SPEED_RATIO : AGENT_CONFIG.SPEED;
+
+        direction.normalize();
+        rbRef.current.setLinvel({
+          x: direction.x * speed,
+          y: rbRef.current.linvel().y,
+          z: direction.z * speed
+        }, true);
+      });
+
+      return React.createElement(
+        RigidBody,
+        {
+          ref: rbRef,
+          position: AGENT_CONFIG.INITIAL_POS,
+          type: 'dynamic',
+          colliders: false,
+          enabledRotations: [false, false, false]
+        },
+        React.createElement('mesh', { castShadow: true, receiveShadow: true },
+          React.createElement('capsuleGeometry', { args: [0.5, 1.0, 4, 16] }),
+          React.createElement('meshStandardMaterial', { color: '#38bdf8', roughness: 0.3, metalness: 0.2 })
+        ),
+        React.createElement(CapsuleCollider, { args: [0.5, 1.0] })
+      );
+    };
+
+    const SimulationScene = () => {
+      const [permanentObstacles, setPermanentObstacles] = useState(() => new Map());
+      const [dynamicObstacles, setDynamicObstacles] = useState(() => new Map());
+      const [goal, setGoal] = useState(GOAL_NODE);
+      const [path, setPath] = useState(() => findPathAStar(START_NODE, GOAL_NODE, new Map()));
+      const [currentIndex, setCurrentIndex] = useState(0);
+      const [crosswalkRed, setCrosswalkRed] = useState(true);
+
+      const goalRef = useRef(goal);
+      const agentNodeRef = useRef(START_NODE);
+      const vehiclesRef = useRef(createInitialVehicles());
+      const vehiclePositionsRef = useRef({});
+
+      const obstacles = useMemo(
+        () => new Map([...permanentObstacles, ...dynamicObstacles]),
+        [permanentObstacles, dynamicObstacles]
+      );
+
+      useEffect(() => {
+        goalRef.current = goal;
+      }, [goal]);
+
+      // 영구 장애물(장벽/경사): 강도 상승 - 3초마다 한 번에 여러 개 생성
+      useEffect(() => {
+        const id = window.setInterval(() => {
+          setPermanentObstacles((prev) =>
+            spawnObstacles(prev, OBSTACLE_SPAWN_CONFIG.SPAWN_COUNT, OBSTACLE_SPAWN_CONFIG.SLOPE_RATIO, [
+              goalRef.current,
+              agentNodeRef.current
+            ])
+          );
+        }, OBSTACLE_SPAWN_CONFIG.INTERVAL_MS);
+        return () => window.clearInterval(id);
+      }, []);
+
+      // 동적 장애물(횡단보도 신호 + 이동 차량): 빠른 주기로 갱신
+      useEffect(() => {
+        const startTime = performance.now();
+        const id = window.setInterval(() => {
+          const elapsed = performance.now() - startTime;
+          const red = isCrosswalkRed(elapsed);
+          setCrosswalkRed(red);
+
+          const next = new Map();
+          if (red) {
+            for (const key of CROSSWALK_KEYS) next.set(key, 'crosswalk');
+          }
+          for (const pos of Object.values(vehiclePositionsRef.current)) {
+            const node = getNearestGridNode({ x: pos.x, z: pos.laneZ * GRID_CONFIG.CELL_SIZE });
+            next.set(toNodeKey(node.x, node.z), 'vehicle');
+          }
+          setDynamicObstacles(next);
+        }, DYNAMIC_TICK_MS);
+        return () => window.clearInterval(id);
+      }, []);
+
+      // 전체 경로 재계산: 목표가 바뀌거나(클릭) 영구 장애물이 늘어났을 때만 수행
+      useEffect(() => {
+        const nextPath = findPathAStar(agentNodeRef.current, goal, obstacles);
+        setPath(nextPath);
+        setCurrentIndex(0);
+      }, [permanentObstacles, goal]);
+
+      const handleGroundClick = (node) => {
+        if (isWalkable(node.x, node.z, obstacles)) {
+          setGoal(node);
+        }
+      };
+
+      const handleVehiclePosition = (id, x, laneZ) => {
+        vehiclePositionsRef.current[id] = { x, laneZ };
+      };
+
+      return React.createElement(
+        React.Fragment,
+        null,
+        React.createElement('gridHelper', { args: [100, 50, '#38bdf8', '#334155'], position: [0, 0.01, 0] }),
+        React.createElement('axesHelper', { args: [8] }),
+        React.createElement(GridTiles, { obstacles }),
+        React.createElement(ObstacleBlocks, { obstacles }),
+        React.createElement(CrosswalkMarkers, { crosswalkRed }),
+        React.createElement(GoalMarker, { goal }),
+        React.createElement(SimulationLights, null),
+        React.createElement(OrbitCameraController, null),
+        ...vehiclesRef.current.map((vehicle) =>
+          React.createElement(VehicleAgent, {
+            key: vehicle.id,
+            vehicle,
+            onPositionUpdate: handleVehiclePosition
+          })
+        ),
+        React.createElement(
+          Physics,
+          { gravity: [0, -9.81, 0] },
+          React.createElement(Ground, { onGroundClick: handleGroundClick }),
+          React.createElement(PlayerAgent, {
+            path,
+            obstacles,
+            goal,
+            onRepathRequest: (newPath) => {
+              setPath(newPath);
+              setCurrentIndex(0);
+            },
+            onProgress: setCurrentIndex,
+            onGridChange: (node) => {
+              agentNodeRef.current = node;
+            }
+          })
+        ),
+        React.createElement(PathLine, { path }),
+        React.createElement(PathWaypointMarkers, { path, currentIndex })
+      );
+    };
+
+    const App = () =>
+      React.createElement(
+        'div',
+        { className: 'app-shell' },
+        React.createElement(
+          'div',
+          { className: 'hud' },
+          '바닥을 클릭해 목적지 이동 · 장벽/경사/차량/횡단보도 장애물 실시간 재계획'
+        ),
+        React.createElement(
+          Canvas,
+          {
+            shadows: true,
+            gl: { antialias: true },
+            dpr: [1, 2],
+            camera: {
+              position: CAMERA_CONFIG.POSITION,
+              fov: CAMERA_CONFIG.FOV,
+              near: CAMERA_CONFIG.NEAR,
+              far: CAMERA_CONFIG.FAR
+            },
+            style: { width: '100vw', height: '100vh' }
+          },
+          React.createElement(SimulationScene, null)
+        )
+      );
+
+    createRoot(document.getElementById('root')).render(React.createElement(App));
+  </script>
+</body>
+</html>
